@@ -1,37 +1,134 @@
 "use client";
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ShieldAlert, Flame, Droplets, Zap, Shield, Swords, RotateCcw, RefreshCcw } from 'lucide-react';
+import { ShieldAlert, Flame, Droplets, Zap, Shield, Swords, RotateCcw, RefreshCcw, Gauge } from 'lucide-react';
 import { useStore } from '@/store/useStore';
 import { Model } from '@/components/RobotViewer';
 import { invoke } from '@tauri-apps/api/core';
 import { RobotRecord } from '@/types/robot';
-import { Canvas } from '@react-three/fiber';
-import { Environment, OrbitControls, ContactShadows, Grid, Sparkles } from '@react-three/drei';
-import { EffectComposer, Bloom, ChromaticAberration } from '@react-three/postprocessing';
-import { BlendFunction } from 'postprocessing';
+import { Canvas, useFrame } from '@react-three/fiber';
+import { OrbitControls, Grid, Sparkles } from '@react-three/drei';
 import * as THREE from 'three';
 
-function BattleRobotModel({ robot, isEnemy, isAttacking }: { robot: RobotRecord, isEnemy: boolean, isAttacking: boolean }) {
+function createBurstDirection(seed: number): THREE.Vector3 {
+    const phi = (seed * 2.399963229728653) % (Math.PI * 2);
+    const y = (((seed * 0.61803398875) % 1) - 0.5) * 0.5;
+    const r = 0.8 + (((seed * 0.41421356237) % 1) * 0.9);
+    return new THREE.Vector3(Math.cos(phi) * r, y, Math.sin(phi) * r).normalize();
+}
+
+const BURST_DIRS: THREE.Vector3[] = Array.from(
+    { length: 10 },
+    (_, idx) => createBurstDirection(idx + 1)
+);
+
+function AttackBurst({ trigger, color }: { trigger: number, color: string }) {
+    const rootRef = useRef<THREE.Group>(null);
+    const ringRef = useRef<THREE.Mesh>(null);
+    const sparkRef = useRef<THREE.Group>(null);
+    const ringMatRef = useRef<THREE.MeshBasicMaterial>(null);
+    const lifeRef = useRef(0);
+    useEffect(() => {
+        if (trigger <= 0) return;
+        lifeRef.current = 1;
+        if (rootRef.current) {
+            rootRef.current.visible = true;
+        }
+    }, [trigger]);
+
+    useFrame((_, delta) => {
+        if (!rootRef.current) return;
+        if (lifeRef.current <= 0) {
+            rootRef.current.visible = false;
+            return;
+        }
+        lifeRef.current = Math.max(0, lifeRef.current - delta * 2.4);
+        const t = 1 - lifeRef.current;
+
+        if (ringRef.current) {
+            const s = 0.25 + t * 1.8;
+            ringRef.current.scale.set(s, s, s);
+            ringRef.current.rotation.z += delta * 3.2;
+        }
+        if (ringMatRef.current) {
+            ringMatRef.current.opacity = (1 - t) * 0.75;
+        }
+
+        if (sparkRef.current) {
+            const children = sparkRef.current.children;
+            for (let idx = 0; idx < children.length; idx += 1) {
+                const child = children[idx];
+                const dir = BURST_DIRS[idx];
+                if (!dir) return;
+                child.position.set(dir.x * t * 1.2, 0.12 + dir.y * t, dir.z * t * 1.2);
+                child.scale.setScalar(1 - t * 0.65);
+            }
+        }
+    });
+
+    return (
+        <group ref={rootRef} visible={false} position={[0, 0.9, 0.2]}>
+            <mesh ref={ringRef} rotation={[Math.PI / 2, 0, 0]}>
+                <torusGeometry args={[0.24, 0.03, 10, 24]} />
+                <meshBasicMaterial ref={ringMatRef} color={color} transparent opacity={0} toneMapped={false} />
+            </mesh>
+            <group ref={sparkRef}>
+                {BURST_DIRS.map((_, idx) => (
+                    <mesh key={idx}>
+                        <sphereGeometry args={[0.045, 8, 8]} />
+                        <meshBasicMaterial color={color} transparent opacity={0.82} toneMapped={false} />
+                    </mesh>
+                ))}
+            </group>
+        </group>
+    );
+}
+
+function BattleRobotModel({
+    robot,
+    isEnemy,
+    isAttacking,
+    isHit,
+    attackFxTrigger,
+    effectsEnabled,
+}: {
+    robot: RobotRecord,
+    isEnemy: boolean,
+    isAttacking: boolean,
+    isHit: boolean,
+    attackFxTrigger: number,
+    effectsEnabled: boolean,
+}) {
     const [idleUrl, setIdleUrl] = useState<string | null>(null);
     const [attackUrl, setAttackUrl] = useState<string | null>(null);
+    const groupRef = useRef<THREE.Group>(null);
+
+    useFrame((state) => {
+        if (!groupRef.current) return;
+        const targetZ = isAttacking ? (isEnemy ? -0.7 : 0.7) : 0;
+        groupRef.current.position.z = THREE.MathUtils.lerp(groupRef.current.position.z, targetZ, 0.12);
+        const hitShake = isHit ? Math.sin(state.clock.elapsedTime * 24) * 0.03 : 0;
+        groupRef.current.position.y = -1 + hitShake;
+        groupRef.current.rotation.z = isHit ? Math.sin(state.clock.elapsedTime * 22) * 0.03 : 0;
+    });
 
     useEffect(() => {
-        if (!robot) return;
         let idleU: string | null = null;
         let attackU: string | null = null;
-
+        let disposed = false;
         async function loadAsset() {
             try {
                 const { readFile } = await import('@tauri-apps/plugin-fs');
                 const idleData = await readFile(robot.model_path);
                 const idleBlob = new Blob([idleData], { type: 'model/gltf-binary' });
                 idleU = URL.createObjectURL(idleBlob);
+                if (disposed) return;
                 setIdleUrl(idleU);
 
                 if (robot.attack_model_path) {
                     const attackData = await readFile(robot.attack_model_path);
                     const attackBlob = new Blob([attackData], { type: 'model/gltf-binary' });
                     attackU = URL.createObjectURL(attackBlob);
+                    if (disposed) return;
                     setAttackUrl(attackU);
                 } else {
                     setAttackUrl(idleU);
@@ -43,10 +140,11 @@ function BattleRobotModel({ robot, isEnemy, isAttacking }: { robot: RobotRecord,
         loadAsset();
 
         return () => {
+            disposed = true;
             if (idleU) URL.revokeObjectURL(idleU);
             if (attackU && attackU !== idleU) URL.revokeObjectURL(attackU);
         };
-    }, [robot]);
+    }, [robot.id, robot.model_path, robot.attack_model_path]);
 
     if (!idleUrl || !attackUrl) return null;
 
@@ -56,9 +154,10 @@ function BattleRobotModel({ robot, isEnemy, isAttacking }: { robot: RobotRecord,
     const positionX = isEnemy ? 2.5 : -2.5;
 
     return (
-        <group position={[positionX, -1, 0]} rotation={[0, rotationY, 0]}>
+        <group ref={groupRef} position={[positionX, -1, 0]} rotation={[0, rotationY, 0]}>
             {/* Spotlight directly on the robot */}
-            <spotLight position={[0, 5, 2]} intensity={2} color={isEnemy ? "#ff5555" : "#55aaff"} angle={0.5} penumbra={1} castShadow />
+            <spotLight position={[0, 5, 2]} intensity={1.2} color={isEnemy ? "#ff5555" : "#55aaff"} angle={0.5} penumbra={1} />
+            {effectsEnabled && <AttackBurst trigger={attackFxTrigger} color={isEnemy ? "#ff3d5f" : "#4fd8ff"} />}
             <Model idleUrl={idleUrl} attackUrl={attackUrl} isAttacking={isAttacking} />
         </group>
     );
@@ -66,9 +165,9 @@ function BattleRobotModel({ robot, isEnemy, isAttacking }: { robot: RobotRecord,
 
 // We'll map the cooking methods to elemental elements
 const COMMANDS = [
-    { id: 'grill', name: 'GRILL', icon: Flame, color: 'text-red-500', bg: 'bg-red-500/10 hover:bg-red-500/20 border-red-500/50', desc: 'High ATK, Low Speed' },
-    { id: 'boil', name: 'BOIL', icon: Droplets, color: 'text-blue-500', bg: 'bg-blue-500/10 hover:bg-blue-500/20 border-blue-500/50', desc: 'Balanced, Healing' },
-    { id: 'fry', name: 'FRY', icon: Zap, color: 'text-yellow-500', bg: 'bg-yellow-500/10 hover:bg-yellow-500/20 border-yellow-500/50', desc: 'High Speed, Pierce' },
+    { id: 'grill', name: 'GRILL', icon: Flame, color: 'text-red-500', bg: 'bg-red-500/10 hover:bg-red-500/20 border-red-500/50', bar: 'from-red-500 to-orange-400', desc: 'Grill > Boil' },
+    { id: 'boil', name: 'BOIL', icon: Droplets, color: 'text-blue-500', bg: 'bg-blue-500/10 hover:bg-blue-500/20 border-blue-500/50', bar: 'from-blue-500 to-cyan-300', desc: 'Boil > Fry' },
+    { id: 'fry', name: 'FRY', icon: Zap, color: 'text-yellow-500', bg: 'bg-yellow-500/10 hover:bg-yellow-500/20 border-yellow-500/50', bar: 'from-yellow-400 to-amber-200', desc: 'Fry > Grill' },
  ] as const;
 
 type CommandId = typeof COMMANDS[number]["id"];
@@ -102,15 +201,23 @@ export default function BattlePage() {
     const [enemyHp, setEnemyHp] = useState(0);
     const [isPlayerAttacking, setIsPlayerAttacking] = useState(false);
     const [isEnemyAttacking, setIsEnemyAttacking] = useState(false);
+    const [isPlayerHit, setIsPlayerHit] = useState(false);
+    const [isEnemyHit, setIsEnemyHit] = useState(false);
+    const [playerAttackFxTrigger, setPlayerAttackFxTrigger] = useState(0);
+    const [enemyAttackFxTrigger, setEnemyAttackFxTrigger] = useState(0);
+    const [isLightweightMode, setIsLightweightMode] = useState(false);
     const [isResolving, setIsResolving] = useState(false);
     const [winner, setWinner] = useState<"player" | "enemy" | null>(null);
     const [roundMessage, setRoundMessage] = useState("プレイヤーロボットを選択してください。");
+    const [phaseBanner, setPhaseBanner] = useState<string | null>(null);
     const [lastPlayerCommand, setLastPlayerCommand] = useState<CommandId | null>(null);
     const [lastEnemyCommand, setLastEnemyCommand] = useState<CommandId | null>(null);
     const timersRef = useRef<number[]>([]);
 
     const clearAllTimers = useCallback(() => {
-        timersRef.current.forEach((id) => window.clearTimeout(id));
+        for (const id of timersRef.current) {
+            window.clearTimeout(id);
+        }
         timersRef.current = [];
     }, []);
 
@@ -131,8 +238,13 @@ export default function BattlePage() {
         setEnemyHp(enemy?.hp ?? 0);
         setIsPlayerAttacking(false);
         setIsEnemyAttacking(false);
+        setIsPlayerHit(false);
+        setIsEnemyHit(false);
+        setPlayerAttackFxTrigger(0);
+        setEnemyAttackFxTrigger(0);
         setIsResolving(false);
         setWinner(null);
+        setPhaseBanner(null);
         setLastPlayerCommand(null);
         setLastEnemyCommand(null);
         setRoundMessage(enemy ? "行動を選択してください。" : "対戦相手がいません。別のロボットを建造してください。");
@@ -198,8 +310,10 @@ export default function BattlePage() {
 
         if (outcome === "draw") {
             setRoundMessage(`あいこ: ${cmdId.toUpperCase()} vs ${enemyCmd.toUpperCase()}。もう一度選択してください。`);
+            setPhaseBanner("DRAW");
             schedule(() => {
                 setIsResolving(false);
+                setPhaseBanner(null);
                 setRoundMessage("行動を選択してください。");
             }, 850);
             return;
@@ -215,31 +329,49 @@ export default function BattlePage() {
         setRoundMessage(
             `${playerWon ? "あなた" : "敵"}の${attacker.name}が ${damage} ダメージを与えた。`
         );
-        setIsPlayerAttacking(playerWon);
-        setIsEnemyAttacking(!playerWon);
+        setPhaseBanner(playerWon ? "YOUR ATTACK" : "ENEMY ATTACK");
+        schedule(() => {
+            setIsPlayerAttacking(playerWon);
+            setIsEnemyAttacking(!playerWon);
+            if (playerWon) {
+                setPlayerAttackFxTrigger((v) => v + 1);
+            } else {
+                setEnemyAttackFxTrigger((v) => v + 1);
+            }
+        }, 150);
 
         schedule(() => {
             setIsPlayerAttacking(false);
             setIsEnemyAttacking(false);
+            setIsPlayerHit(!playerWon);
+            setIsEnemyHit(playerWon);
+        }, 880);
+
+        schedule(() => {
             setPlayerHp(nextPlayerHp);
             setEnemyHp(nextEnemyHp);
+            setIsPlayerHit(false);
+            setIsEnemyHit(false);
+            setPhaseBanner(null);
 
             if (nextEnemyHp <= 0) {
                 setWinner("player");
                 setRoundMessage("YOU WIN");
+                setPhaseBanner("YOU WIN");
                 setIsResolving(false);
                 return;
             }
             if (nextPlayerHp <= 0) {
                 setWinner("enemy");
                 setRoundMessage("YOU LOSE");
+                setPhaseBanner("YOU LOSE");
                 setIsResolving(false);
                 return;
             }
 
             setRoundMessage("行動を選択してください。");
             setIsResolving(false);
-        }, 1200);
+        }, 1180);
     };
 
     if (loadingRobots) {
@@ -329,6 +461,20 @@ export default function BattlePage() {
 
             {/* Main 3D Arena Canvas */}
             <div className="flex-1 relative bg-zinc-950 rounded-3xl border border-zinc-800 overflow-hidden shadow-inner">
+                {phaseBanner && (
+                    <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
+                        <div className={`px-8 py-5 rounded-2xl border text-3xl md:text-5xl font-black tracking-tight backdrop-blur-sm ${phaseBanner === "YOU WIN"
+                            ? "bg-emerald-900/70 border-emerald-500/50 text-emerald-200"
+                            : phaseBanner === "YOU LOSE"
+                                ? "bg-red-900/70 border-red-500/50 text-red-200"
+                                : phaseBanner === "DRAW"
+                                    ? "bg-zinc-900/80 border-zinc-500/60 text-zinc-200"
+                                    : "bg-orange-900/70 border-orange-400/60 text-orange-100"
+                            }`}>
+                            {phaseBanner}
+                        </div>
+                    </div>
+                )}
                 {loadingEnemy && (
                     <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
                         <div className="bg-red-950/80 border border-red-900 px-6 py-3 rounded-full flex items-center gap-3 animate-pulse">
@@ -338,15 +484,18 @@ export default function BattlePage() {
                     </div>
                 )}
 
-                <Canvas shadows camera={{ position: [0, 2, 8], fov: 45 }}>
+                <Canvas
+                    camera={{ position: [0, 2, 8], fov: 45 }}
+                    dpr={[1, 1.25]}
+                    gl={{ antialias: false, powerPreference: "high-performance" }}
+                >
                     <color attach="background" args={['#050508']} />
 
                     {/* Scene Lighting */}
-                    <ambientLight intensity={0.2} color="#ffffff" />
-                    <directionalLight position={[0, 10, -10]} intensity={1} color="#5555ff" />
-                    <pointLight position={[-5, 2, 5]} intensity={2} color="#00ffff" distance={20} />
-                    <pointLight position={[5, 2, 5]} intensity={2} color="#ff0044" distance={20} />
-                    <Environment preset="night" />
+                    <ambientLight intensity={0.45} color="#ffffff" />
+                    <directionalLight position={[0, 8, -8]} intensity={0.9} color="#6e82ff" />
+                    <pointLight position={[-5, 2, 5]} intensity={1.1} color="#00ffff" distance={18} />
+                    <pointLight position={[5, 2, 5]} intensity={1.1} color="#ff0044" distance={18} />
 
                     {/* Cyber Grid Floor */}
                     <Grid
@@ -362,12 +511,13 @@ export default function BattlePage() {
                         fadeStrength={1}
                     />
 
-                    {/* Shadow Catcher */}
-                    <ContactShadows position={[0, -0.99, 0]} opacity={0.5} scale={20} blur={2.5} far={4} color="#000000" />
-
                     {/* Ambient Particles */}
-                    <Sparkles count={100} scale={15} size={2} speed={0.4} opacity={0.3} color="#00ffff" position={[-3, 2, 0]} />
-                    <Sparkles count={100} scale={15} size={2} speed={0.4} opacity={0.3} color="#ff0044" position={[3, 2, 0]} />
+                    {!isLightweightMode && (
+                        <>
+                            <Sparkles count={28} scale={15} size={1.6} speed={0.22} opacity={0.16} color="#00ffff" position={[-3, 2, 0]} />
+                            <Sparkles count={28} scale={15} size={1.6} speed={0.22} opacity={0.16} color="#ff0044" position={[3, 2, 0]} />
+                        </>
+                    )}
 
                     {/* Camera Control - restrict movement for cinematic feel */}
                     <OrbitControls
@@ -383,18 +533,26 @@ export default function BattlePage() {
                     {/* Robots */}
                     <React.Suspense fallback={null}>
                         {selectedPlayerRobot && (
-                            <BattleRobotModel robot={selectedPlayerRobot} isEnemy={false} isAttacking={isPlayerAttacking} />
+                            <BattleRobotModel
+                                robot={selectedPlayerRobot}
+                                isEnemy={false}
+                                isAttacking={isPlayerAttacking}
+                                isHit={isPlayerHit}
+                                attackFxTrigger={playerAttackFxTrigger}
+                                effectsEnabled={!isLightweightMode}
+                            />
                         )}
                         {selectedEnemyRobot && (
-                            <BattleRobotModel robot={selectedEnemyRobot} isEnemy={true} isAttacking={isEnemyAttacking} />
+                            <BattleRobotModel
+                                robot={selectedEnemyRobot}
+                                isEnemy={true}
+                                isAttacking={isEnemyAttacking}
+                                isHit={isEnemyHit}
+                                attackFxTrigger={enemyAttackFxTrigger}
+                                effectsEnabled={!isLightweightMode}
+                            />
                         )}
                     </React.Suspense>
-
-                    {/* Post Processing for Cyberpunk Vibe */}
-                    <EffectComposer>
-                        <Bloom luminanceThreshold={0.5} mipmapBlur intensity={1.5} />
-                        <ChromaticAberration blendFunction={BlendFunction.NORMAL} offset={new THREE.Vector2(0.002, 0.002)} />
-                    </EffectComposer>
                 </Canvas>
             </div>
 
@@ -420,7 +578,7 @@ export default function BattlePage() {
                                 disabled={isResolving || winner !== null || !selectedEnemyRobot}
                                 className={`relative group overflow-hidden border-2 rounded-2xl p-4 flex flex-col items-center gap-2 transition-all duration-200 ${cmd.bg} ${(isResolving || winner !== null || !selectedEnemyRobot) ? 'opacity-50 cursor-not-allowed' : 'active:scale-95'}`}
                             >
-                                <div className={`absolute top-0 left-0 w-full h-1 bg-gradient-to-r ${cmd.color.replace('text-', 'from-').replace('text-', 'to-')} opacity-0 group-hover:opacity-100 transition-opacity`} />
+                                <div className={`absolute top-0 left-0 w-full h-1 bg-gradient-to-r ${cmd.bar} opacity-0 group-hover:opacity-100 transition-opacity`} />
                                 <Icon size={32} className={cmd.color} />
                                 <span className={`font-black tracking-widest text-lg md:text-xl ${cmd.color}`}>{cmd.name}</span>
                                 <span className="text-xs font-mono text-zinc-400">{cmd.desc}</span>
@@ -430,6 +588,14 @@ export default function BattlePage() {
                 </div>
 
                 <div className="mt-4 flex flex-wrap justify-center gap-3">
+                    <button
+                        onClick={() => setIsLightweightMode((v) => !v)}
+                        disabled={isResolving}
+                        className={`px-4 py-2 rounded-full border text-sm font-semibold flex items-center gap-2 ${isResolving ? "border-zinc-700 text-zinc-600" : isLightweightMode ? "border-emerald-500/60 text-emerald-300 bg-emerald-900/20" : "border-zinc-600 text-zinc-300 hover:border-emerald-400 hover:text-emerald-300"}`}
+                    >
+                        <Gauge size={16} />
+                        軽量モード {isLightweightMode ? "ON" : "OFF"}
+                    </button>
                     <button
                         onClick={handleRerollEnemy}
                         disabled={isResolving}

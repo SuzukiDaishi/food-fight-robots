@@ -1,86 +1,222 @@
 "use client";
 import React, { useRef, useEffect } from 'react';
-import { Canvas } from '@react-three/fiber';
-import { OrbitControls, useGLTF, useAnimations, Environment, Clone } from '@react-three/drei';
+import { Canvas, useFrame } from '@react-three/fiber';
+import { OrbitControls, useGLTF, Environment } from '@react-three/drei';
 import * as THREE from 'three';
-import { invoke } from "@tauri-apps/api/core";
+import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js';
+
+function pickClip(clips: THREE.AnimationClip[], patterns: RegExp[], fallbackToLongest = false): THREE.AnimationClip | null {
+    if (!clips || clips.length === 0) return null;
+    const byName = clips.find((clip) => patterns.some((p) => p.test(clip.name)));
+    if (byName) return byName;
+    if (fallbackToLongest) {
+        return clips.reduce((acc, cur) => (cur.duration > acc.duration ? cur : acc), clips[0]);
+    }
+    return clips[0];
+}
+
+function trackNodeName(trackName: string): string {
+    const [node] = trackName.split('.');
+    return node ?? '';
+}
+
+function trackPropertyName(trackName: string): string {
+    const parts = trackName.split('.');
+    return parts[parts.length - 1] ?? '';
+}
+
+function stripRootMotionTracks(clip: THREE.AnimationClip): THREE.AnimationClip {
+    const tracks = clip.tracks.filter((track) => {
+        const node = trackNodeName(track.name);
+        const prop = trackPropertyName(track.name);
+        if (!/position/i.test(prop)) return true;
+        return !/(root|hips|hip|pelvis|armature)/i.test(node);
+    });
+    if (tracks.length === clip.tracks.length) return clip;
+    return new THREE.AnimationClip(clip.name, clip.duration, tracks);
+}
+
+function buildCompatibleClip(clip: THREE.AnimationClip, nodeNames: Set<string>): THREE.AnimationClip | null {
+    const compatibleTracks = clip.tracks.filter((track) => nodeNames.has(trackNodeName(track.name)));
+    if (compatibleTracks.length === 0) return null;
+    return new THREE.AnimationClip(clip.name, clip.duration, compatibleTracks);
+}
 
 export function Model({ idleUrl, attackUrl, isAttacking }: { idleUrl: string, attackUrl: string, isAttacking: boolean }) {
     const group = useRef<THREE.Group>(null);
     const idleGltf = useGLTF(idleUrl);
     const attackGltf = useGLTF(attackUrl);
-
-    // Combine animations and give them explicit names
-    const combinedAnimations = React.useMemo(() => {
-        const cloned: THREE.AnimationClip[] = [];
-        if (idleGltf.animations && idleGltf.animations.length > 0) {
-            const idleClip = idleGltf.animations[0].clone();
-            idleClip.name = "Idle";
-            cloned.push(idleClip);
-        }
-        if (attackGltf.animations && attackGltf.animations.length > 0) {
-            const attackClip = attackGltf.animations[0].clone();
-            attackClip.name = "Attack";
-            cloned.push(attackClip);
-        }
-        return cloned;
-    }, [idleGltf.animations, attackGltf.animations]);
-
-    const { actions, mixer } = useAnimations(combinedAnimations, group);
+    const mixerRef = useRef<THREE.AnimationMixer | null>(null);
+    const idleActionRef = useRef<THREE.AnimationAction | null>(null);
+    const attackActionRef = useRef<THREE.AnimationAction | null>(null);
     const isAttackingRef = useRef(false);
+    const fallbackReturnTimerRef = useRef<number | null>(null);
+    const attackStopTimerRef = useRef<number | null>(null);
+    const TRANSITION_SECONDS = 0.2;
 
-    // Setup persistent Idle and finish listeners
-    useEffect(() => {
-        if (!actions || !mixer) return;
-        const idle = actions["Idle"];
-        const attack = actions["Attack"];
-
-        if (idle) {
-            idle.setLoop(THREE.LoopRepeat, Infinity);
-            idle.enabled = true;
-            idle.reset().play();
-        }
-
-        const FADE = 0.15;
-        const onFinished = (e: any) => {
-            if (e.action === attack && idle && attack) {
-                idle.play();
-                idle.crossFadeFrom(attack, FADE, true);
-                attack.stop();
+    const modelScene = React.useMemo(() => {
+        const cloned = cloneSkeleton(idleGltf.scene) as THREE.Object3D;
+        cloned.traverse((obj) => {
+            const mesh = obj as THREE.Mesh;
+            if (mesh.isMesh || (mesh as THREE.SkinnedMesh).isSkinnedMesh) {
+                mesh.frustumCulled = false;
             }
+        });
+        return cloned;
+    }, [idleGltf.scene]);
+    const sceneNodeNames = React.useMemo(() => {
+        const names = new Set<string>();
+        modelScene.traverse((obj) => {
+            if (obj.name) names.add(obj.name);
+        });
+        return names;
+    }, [modelScene]);
+
+    const combinedAnimations = React.useMemo<THREE.AnimationClip[]>(() => {
+        const idleSource = pickClip(
+            idleGltf.animations ?? [],
+            [/idle/i, /stand/i, /breath/i, /loop/i],
+            true
+        );
+        const attackSource = pickClip(
+            attackGltf.animations ?? [],
+            [/attack/i, /punch/i, /slash/i, /kick/i, /hit/i],
+            false
+        ) ?? pickClip(attackGltf.animations ?? [], [], false);
+
+        const clips: THREE.AnimationClip[] = [];
+        if (idleSource) {
+            const idle = stripRootMotionTracks(idleSource.clone());
+            idle.name = "Idle";
+            if (idle.tracks.length > 0) {
+                clips.push(idle);
+            }
+        }
+        if (attackSource) {
+            const attackCandidate = stripRootMotionTracks(attackSource.clone());
+            const compatibleAttack = buildCompatibleClip(attackCandidate, sceneNodeNames);
+            if (compatibleAttack && compatibleAttack.tracks.length > 0) {
+                compatibleAttack.name = "Attack";
+                clips.push(compatibleAttack);
+            }
+        }
+        return clips;
+    }, [idleGltf.animations, attackGltf.animations, sceneNodeNames]);
+
+    const idleClip = combinedAnimations.find((clip) => clip.name === "Idle") ?? null;
+    const attackClip = combinedAnimations.find((clip) => clip.name === "Attack") ?? null;
+
+    const clearReturnTimer = () => {
+        if (fallbackReturnTimerRef.current !== null) {
+            window.clearTimeout(fallbackReturnTimerRef.current);
+            fallbackReturnTimerRef.current = null;
+        }
+    };
+
+    const clearAttackStopTimer = () => {
+        if (attackStopTimerRef.current !== null) {
+            window.clearTimeout(attackStopTimerRef.current);
+            attackStopTimerRef.current = null;
+        }
+    };
+
+    const returnToIdle = React.useCallback(() => {
+        const idle = idleActionRef.current;
+        const attack = attackActionRef.current;
+        if (!idle) return;
+        idle.enabled = true;
+        idle.setEffectiveWeight(1).play();
+        if (attack && attack.isRunning()) {
+            idle.crossFadeFrom(attack, TRANSITION_SECONDS, true);
+            attack.fadeOut(TRANSITION_SECONDS);
+            clearAttackStopTimer();
+            attackStopTimerRef.current = window.setTimeout(() => {
+                attack.stop();
+                attackStopTimerRef.current = null;
+            }, TRANSITION_SECONDS * 1000 + 30);
+        }
+        isAttackingRef.current = false;
+        clearReturnTimer();
+    }, []);
+
+    useEffect(() => {
+        const root = group.current;
+        if (!root || !idleClip) return;
+        const mixer = new THREE.AnimationMixer(root);
+        mixerRef.current = mixer;
+
+        const idle = mixer.clipAction(idleClip);
+        idle.reset();
+        idle.setLoop(THREE.LoopRepeat, Infinity);
+        idle.clampWhenFinished = false;
+        idle.play();
+        idleActionRef.current = idle;
+
+        const attack = attackClip ? mixer.clipAction(attackClip) : null;
+        attackActionRef.current = attack;
+        isAttackingRef.current = false;
+
+        const onFinished = (e: THREE.Event & { action?: THREE.AnimationAction }) => {
+            if (e.action === attackActionRef.current) {
+                returnToIdle();
+            }            
         };
 
-        mixer.addEventListener("finished", onFinished);
-
+        mixer.addEventListener("finished", onFinished);        
         return () => {
+            clearReturnTimer();
+            clearAttackStopTimer();
             mixer.removeEventListener("finished", onFinished);
             mixer.stopAllAction();
+            if (idleClip) mixer.uncacheClip(idleClip);
+            if (attackClip) mixer.uncacheClip(attackClip);
+            mixer.uncacheRoot(root);
+            mixerRef.current = null;
+            idleActionRef.current = null;
+            attackActionRef.current = null;
+            isAttackingRef.current = false;
         };
-    }, [actions, mixer]);
+    }, [idleClip, attackClip, returnToIdle]);
 
-    // Handle Attack triggers
+    useFrame((_, delta) => {
+        mixerRef.current?.update(delta);
+        const idle = idleActionRef.current;
+        if (!isAttackingRef.current && idle && !idle.isRunning()) {
+            idle.reset();
+            idle.setEffectiveWeight(1);
+            idle.play();
+        }
+    });
+
     useEffect(() => {
-        if (!actions) return;
-        const idle = actions["Idle"];
-        const attack = actions["Attack"];
-        if (!idle || !attack) return;
+        const idle = idleActionRef.current;
+        const attack = attackActionRef.current;
+        if (!idle) return;
 
         if (isAttacking && !isAttackingRef.current) {
+            if (!attack) return;
             isAttackingRef.current = true;
-            const FADE = 0.15;
             attack.setLoop(THREE.LoopOnce, 1);
             attack.clampWhenFinished = false;
             attack.enabled = true;
+            attack.setEffectiveWeight(1).setEffectiveTimeScale(1);
             attack.reset().play();
-            attack.crossFadeFrom(idle, FADE, true);
-        } else if (!isAttacking) {
-            isAttackingRef.current = false;
+            attack.crossFadeFrom(idle, TRANSITION_SECONDS, true);
+
+            clearReturnTimer();
+            fallbackReturnTimerRef.current = window.setTimeout(() => {
+                returnToIdle();
+            }, Math.max(400, attack.getClip().duration * 1000 + 220));
         }
-    }, [isAttacking, actions]);
+
+        if (!isAttacking && isAttackingRef.current) {
+            returnToIdle();
+        }
+    }, [isAttacking, returnToIdle]);
 
     return (
         <group ref={group}>
-            <Clone object={idleGltf.scene} scale={[1.5, 1.5, 1.5]} position={[0, -1, 0]} />
+            <primitive object={modelScene} scale={[1.5, 1.5, 1.5]} position={[0, -1, 0]} />
         </group>
     );
 }
@@ -95,32 +231,27 @@ export default function RobotViewer({ modelPath, attackModelPath, overrideAttack
 
     useEffect(() => {
         if (!modelPath) return;
+        let idleUrl: string | null = null;
+        let attackUrl: string | null = null;
+        let disposed = false;
 
-        // In Tauri, to load a local file in an <img> or Three.js loader, we must use the custom protocol `asset://`
-        // Convert absolute path to an asset URL
         async function loadAsset() {
             try {
-                // Tauri v2 allows converting file path to asset url format 
-                // format: asset://localhost/path/to/file
-                // We need to fetch the file contents as blob and create a local URL.
-                // But Three.js loaders sometimes struggle with asset:// directly.
-                // Safest cross-platform way is to read the file as an array buffer.
                 const { readFile } = await import('@tauri-apps/plugin-fs');
 
-                // Load Idle Model
                 const idleData = await readFile(modelPath);
                 const idleBlob = new Blob([idleData], { type: 'model/gltf-binary' });
-                const idleUrl = URL.createObjectURL(idleBlob);
+                idleUrl = URL.createObjectURL(idleBlob);
+                if (disposed) return;
                 setIdleAssetUrl(idleUrl);
 
-                // Load Attack Model dynamically if provided
                 if (attackModelPath) {
                     const attackData = await readFile(attackModelPath);
                     const attackBlob = new Blob([attackData], { type: 'model/gltf-binary' });
-                    const attackUrl = URL.createObjectURL(attackBlob);
+                    attackUrl = URL.createObjectURL(attackBlob);
+                    if (disposed) return;
                     setAttackAssetUrl(attackUrl);
                 } else {
-                    // Fallback identical if no attack model
                     setAttackAssetUrl(idleUrl);
                 }
             } catch (e) {
@@ -131,8 +262,9 @@ export default function RobotViewer({ modelPath, attackModelPath, overrideAttack
         loadAsset();
 
         return () => {
-            if (idleAssetUrl) URL.revokeObjectURL(idleAssetUrl);
-            if (attackAssetUrl && attackAssetUrl !== idleAssetUrl) URL.revokeObjectURL(attackAssetUrl);
+            disposed = true;
+            if (idleUrl) URL.revokeObjectURL(idleUrl);
+            if (attackUrl && attackUrl !== idleUrl) URL.revokeObjectURL(attackUrl);
         };
     }, [modelPath, attackModelPath]);
 
@@ -151,7 +283,11 @@ export default function RobotViewer({ modelPath, attackModelPath, overrideAttack
                 <directionalLight position={[10, 10, 10]} intensity={1} />
                 <Environment preset="city" />
                 <React.Suspense fallback={null}>
-                    <Model idleUrl={idleAssetUrl} attackUrl={attackAssetUrl} isAttacking={isAttacking} />
+                    <Model
+                        idleUrl={idleAssetUrl}
+                        attackUrl={attackAssetUrl}
+                        isAttacking={isAttacking}
+                    />
                 </React.Suspense>
                 <OrbitControls autoRotate={!isAttacking} autoRotateSpeed={2} enablePan={false} maxDistance={10} minDistance={2} />
             </Canvas>
