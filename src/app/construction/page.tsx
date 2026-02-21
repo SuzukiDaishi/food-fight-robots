@@ -146,7 +146,13 @@ export default function ConstructionPage() {
       setProgressMsg("Construction Complete!");
     } catch (err) {
       console.error(err);
-      setProgressMsg("Error occurred.");
+      const errMsg =
+        typeof err === "string"
+          ? err
+          : (err && typeof err === "object" && "message" in err)
+            ? String((err as { message?: unknown }).message ?? "Unknown error")
+            : "Unknown error";
+      setProgressMsg(`Error: ${errMsg}`);
     } finally {
       setLoading(false);
       setIsGenerating(false);

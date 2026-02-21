@@ -220,7 +220,14 @@ pub async fn poll_for_rigging_success(app: &AppHandle, task_id: String) -> Resul
                         return Ok(());
                     }
                     "FAILED" | "CANCELED" => {
-                        return Err(format!("Rigging task failed or canceled. ID: {}", task_id));
+                        let err_msg = task_status
+                            .task_error
+                            .map(|e| e.message)
+                            .unwrap_or_else(|| "No detailed message from Meshy".to_string());
+                        return Err(format!(
+                            "Rigging task failed or canceled. ID: {}. Reason: {}",
+                            task_id, err_msg
+                        ));
                     }
                     _ => {
                         // PENDING or IN_PROGRESS, continue polling
@@ -289,6 +296,7 @@ pub struct AnimationTaskStatusResponse {
     pub status: String,
     pub progress: Option<u32>,
     pub result: Option<AnimationUrls>,
+    pub task_error: Option<TaskError>,
 }
 
 pub async fn poll_for_animation_glb(app: &AppHandle, task_id: String, anim_name: &str) -> Result<String, String> {
@@ -331,7 +339,14 @@ pub async fn poll_for_animation_glb(app: &AppHandle, task_id: String, anim_name:
                         }
                     }
                     "FAILED" | "CANCELED" => {
-                        return Err(format!("Animation task failed or canceled. ID: {}", task_id));
+                        let err_msg = task_status
+                            .task_error
+                            .map(|e| e.message)
+                            .unwrap_or_else(|| "No detailed message from Meshy".to_string());
+                        return Err(format!(
+                            "Animation task failed or canceled. ID: {}. Reason: {}",
+                            task_id, err_msg
+                        ));
                     }
                     _ => {
                         let _ = app.emit("pipeline-progress", format!("Applying Animation ({}): {}%", anim_name, task_status.progress.unwrap_or(0)));

@@ -61,8 +61,8 @@ async fn run_generation_pipeline(
     let _ = app.emit("pipeline-progress", "Submitting 3D Generation Task to Meshy...");
     let task_id = meshy::create_image_to_3d_task(gen_image_b64.clone()).await?;
     
-    // We just poll to wait for it to finish, we don't need to download the un-animated base GLB locally.
-    meshy::poll_for_glb_url(&app, task_id.clone()).await?;
+    // Keep base GLB URL for fallback when rigging/animation fails.
+    let base_glb_url = meshy::poll_for_glb_url(&app, task_id.clone()).await?;
 
     let app_data_dir = app.path().app_data_dir().unwrap();
     let original_image_filename = format!("{}_original.png", task_id);
@@ -90,30 +90,45 @@ async fn run_generation_pipeline(
         image_path: generated_image_path.to_string_lossy().to_string(),
     });
 
-    // Step 4: Rig the model
-    let _ = app.emit("pipeline-progress", "Creating Rigging task...");
-    let rig_task_id = meshy::create_rigging_task(task_id.clone()).await?;
-    meshy::poll_for_rigging_success(&app, rig_task_id.clone()).await?;
+    // Step 4-6: Try rig+animation first; if unsupported/failed, fallback to static base model.
+    let rigged_model_paths: Result<(String, String), String> = async {
+        let _ = app.emit("pipeline-progress", "Creating Rigging task...");
+        let rig_task_id = meshy::create_rigging_task(task_id.clone()).await?;
+        meshy::poll_for_rigging_success(&app, rig_task_id.clone()).await?;
 
-    // Step 5: Animate the rigged model (Idle = 0, Attack = 92)
-    let _ = app.emit("pipeline-progress", "Creating Animation tasks (Idle and Attack)...");
-    let idle_anim_task_id = meshy::create_animation_task(rig_task_id.clone(), 0).await?;
-    let attack_anim_task_id = meshy::create_animation_task(rig_task_id.clone(), 92).await?;
+        let _ = app.emit("pipeline-progress", "Creating Animation tasks (Idle and Attack)...");
+        let idle_anim_task_id = meshy::create_animation_task(rig_task_id.clone(), 0).await?;
+        let attack_anim_task_id = meshy::create_animation_task(rig_task_id.clone(), 92).await?;
 
-    let (idle_url_res, attack_url_res) = tokio::join!(
-        meshy::poll_for_animation_glb(&app, idle_anim_task_id.clone(), "Idle"),
-        meshy::poll_for_animation_glb(&app, attack_anim_task_id.clone(), "Attack")
-    );
+        let (idle_url_res, attack_url_res) = tokio::join!(
+            meshy::poll_for_animation_glb(&app, idle_anim_task_id.clone(), "Idle"),
+            meshy::poll_for_animation_glb(&app, attack_anim_task_id.clone(), "Attack")
+        );
 
-    let idle_url = idle_url_res?;
-    let attack_url = attack_url_res?;
+        let idle_url = idle_url_res?;
+        let attack_url = attack_url_res?;
 
-    // Step 6: Download GLB models
-    let idle_filename = format!("{}_idle.glb", task_id);
-    let attack_filename = format!("{}_attack.glb", task_id);
+        let idle_filename = format!("{}_idle.glb", task_id);
+        let attack_filename = format!("{}_attack.glb", task_id);
+        let idle_path = meshy::download_glb(app.clone(), idle_url, idle_filename).await?;
+        let attack_path = meshy::download_glb(app.clone(), attack_url, attack_filename).await?;
+        Ok((idle_path, attack_path))
+    }.await;
 
-    let idle_path = meshy::download_glb(app.clone(), idle_url, idle_filename).await?;
-    let attack_path = meshy::download_glb(app.clone(), attack_url, attack_filename).await?;
+    let (idle_path, attack_path) = match rigged_model_paths {
+        Ok(paths) => paths,
+        Err(err) => {
+            eprintln!("Rigging/animation pipeline failed for task {}: {}", task_id, err);
+            let _ = app.emit(
+                "pipeline-progress",
+                "Rigging/animation unavailable. Falling back to static model..."
+            );
+
+            let fallback_filename = format!("{}_base.glb", task_id);
+            let fallback_path = meshy::download_glb(app.clone(), base_glb_url, fallback_filename).await?;
+            (fallback_path.clone(), fallback_path)
+        }
+    };
 
     let elapsed = start_time.elapsed().unwrap_or_default().as_millis() as i64;
     let created_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;

@@ -124,7 +124,7 @@ function BattleRobotModel({
                 if (disposed) return;
                 setIdleUrl(idleU);
 
-                if (robot.attack_model_path) {
+                if (robot.attack_model_path && robot.attack_model_path !== robot.model_path) {
                     const attackData = await readFile(robot.attack_model_path);
                     const attackBlob = new Blob([attackData], { type: 'model/gltf-binary' });
                     attackU = URL.createObjectURL(attackBlob);

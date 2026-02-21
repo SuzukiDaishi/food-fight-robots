@@ -5,6 +5,84 @@ import { OrbitControls, useGLTF, Environment } from '@react-three/drei';
 import * as THREE from 'three';
 import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js';
 
+type CachedAssetUrl = {
+    url: string;
+    refCount: number;
+    revokeTimer: number | null;
+    loading?: Promise<string>;
+};
+
+const assetUrlCache = new Map<string, CachedAssetUrl>();
+const ASSET_URL_REVOKE_DELAY_MS = 30_000;
+
+async function createAssetUrlFromPath(path: string): Promise<string> {
+    const { readFile } = await import('@tauri-apps/plugin-fs');
+    const data = await readFile(path);
+    const blob = new Blob([data], { type: 'model/gltf-binary' });
+    return URL.createObjectURL(blob);
+}
+
+async function acquireCachedAssetUrl(path: string): Promise<string> {
+    let entry = assetUrlCache.get(path);
+
+    if (!entry) {
+        const loading = createAssetUrlFromPath(path);
+        entry = { url: "", refCount: 0, revokeTimer: null, loading };
+        assetUrlCache.set(path, entry);
+        try {
+            const url = await loading;
+            const current = assetUrlCache.get(path);
+            if (!current) {
+                URL.revokeObjectURL(url);
+                throw new Error(`Asset cache entry disappeared while loading: ${path}`);
+            }
+            current.url = url;
+            delete current.loading;
+            entry = current;
+        } catch (e) {
+            assetUrlCache.delete(path);
+            throw e;
+        }
+    } else if (entry.loading) {
+        await entry.loading;
+        const current = assetUrlCache.get(path);
+        if (!current || !current.url) {
+            throw new Error(`Failed to cache asset URL: ${path}`);
+        }
+        entry = current;
+    }
+
+    if (!entry.url) {
+        throw new Error(`Missing cached asset URL: ${path}`);
+    }
+
+    if (entry.revokeTimer !== null) {
+        window.clearTimeout(entry.revokeTimer);
+        entry.revokeTimer = null;
+    }
+    entry.refCount += 1;
+    return entry.url;
+}
+
+function releaseCachedAssetUrl(path: string): void {
+    const entry = assetUrlCache.get(path);
+    if (!entry) return;
+
+    entry.refCount = Math.max(0, entry.refCount - 1);
+    if (entry.refCount > 0) return;
+
+    if (entry.revokeTimer !== null) {
+        window.clearTimeout(entry.revokeTimer);
+    }
+
+    entry.revokeTimer = window.setTimeout(() => {
+        const current = assetUrlCache.get(path);
+        if (!current || current.refCount > 0 || !current.url) return;
+        URL.revokeObjectURL(current.url);
+        assetUrlCache.delete(path);
+    }, ASSET_URL_REVOKE_DELAY_MS);
+}
+
 function pickClip(clips: THREE.AnimationClip[], patterns: RegExp[], fallbackToLongest = false): THREE.AnimationClip | null {
     if (!clips || clips.length === 0) return null;
     const byName = clips.find((clip) => patterns.some((p) => p.test(clip.name)));
@@ -231,29 +309,37 @@ export default function RobotViewer({ modelPath, attackModelPath, overrideAttack
 
     useEffect(() => {
         if (!modelPath) return;
-        let idleUrl: string | null = null;
-        let attackUrl: string | null = null;
         let disposed = false;
+        const acquiredPaths: string[] = [];
+        const attackPath = attackModelPath && attackModelPath !== modelPath ? attackModelPath : modelPath;
+
+        const releaseAll = () => {
+            for (const path of acquiredPaths) {
+                releaseCachedAssetUrl(path);
+            }
+            acquiredPaths.length = 0;
+        };
 
         async function loadAsset() {
             try {
-                const { readFile } = await import('@tauri-apps/plugin-fs');
-
-                const idleData = await readFile(modelPath);
-                const idleBlob = new Blob([idleData], { type: 'model/gltf-binary' });
-                idleUrl = URL.createObjectURL(idleBlob);
-                if (disposed) return;
+                const idleUrl = await acquireCachedAssetUrl(modelPath);
+                acquiredPaths.push(modelPath);
+                if (disposed) {
+                    releaseAll();
+                    return;
+                }
                 setIdleAssetUrl(idleUrl);
 
-                if (attackModelPath) {
-                    const attackData = await readFile(attackModelPath);
-                    const attackBlob = new Blob([attackData], { type: 'model/gltf-binary' });
-                    attackUrl = URL.createObjectURL(attackBlob);
-                    if (disposed) return;
-                    setAttackAssetUrl(attackUrl);
-                } else {
-                    setAttackAssetUrl(idleUrl);
+                let resolvedAttackUrl = idleUrl;
+                if (attackPath !== modelPath) {
+                    resolvedAttackUrl = await acquireCachedAssetUrl(attackPath);
+                    acquiredPaths.push(attackPath);
+                    if (disposed) {
+                        releaseAll();
+                        return;
+                    }
                 }
+                setAttackAssetUrl(resolvedAttackUrl);
             } catch (e) {
                 console.error("Failed to load 3D models from disk:", e);
             }
@@ -263,8 +349,7 @@ export default function RobotViewer({ modelPath, attackModelPath, overrideAttack
 
         return () => {
             disposed = true;
-            if (idleUrl) URL.revokeObjectURL(idleUrl);
-            if (attackUrl && attackUrl !== idleUrl) URL.revokeObjectURL(attackUrl);
+            releaseAll();
         };
     }, [modelPath, attackModelPath]);
 
