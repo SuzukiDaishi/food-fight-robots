@@ -1,83 +1,115 @@
 # Food Fight Robots
 
-![Food Fight Robots UI](docs/image.png)
+Food image in, battle robot out. This project uses `Next.js 16 + React 19` for the UI and `Tauri v2 + Rust` for desktop-side orchestration, storage, and API access.
 
-食べ物画像から「戦闘ロボット」を生成し、図鑑で管理してバトルできるデスクトップアプリです。  
-フロントエンドは Next.js、ローカル実行とファイル保存は Tauri + Rust で構成しています。
+## What It Does
 
-## 主な機能
+- Upload a food image in the Construction screen
+- Normalize the input to PNG on the frontend for stable cross-platform behavior
+- Generate robot stats and lore with Gemini
+- Generate a concept image and 3D model with Gemini + Meshy
+- Save images, GLB files, and SQLite data under the Tauri app data directory
+- Browse generated robots in Encyclopedia and use them in Battle
 
-- 食べ物画像を入力してロボット設定（Name / Lore / HP / ATK / DEF）を生成
-- コンセプト画像生成
-- 3Dモデル生成（Meshy API）
-- 図鑑表示（ローカルDB保存）
-- バトル画面でのアニメーション再生
-- Rigging/Animation 失敗時の静的モデルフォールバック
+## Stack
 
-## 技術スタック
-
-- Frontend: Next.js 16, React 19, TypeScript, Tailwind CSS
-- 3D: three.js, @react-three/fiber, @react-three/drei
-- Desktop/Backend: Tauri v2, Rust
-- Storage: SQLite (Tauri app data dir)
+- Frontend: Next.js, React, TypeScript, Tailwind CSS
+- 3D: three.js, `@react-three/fiber`, `@react-three/drei`
+- Desktop backend: Tauri v2, Rust
+- Storage: SQLite via `rusqlite`
 - External APIs: Gemini API, Meshy API
 
-## セットアップ
+## Prerequisites
 
-### 1. 前提環境
+### Common
 
-- Node.js (推奨: 20+)
+- Node.js 20+
 - npm
-- Rust (stable)
-- Tauri v2 のビルド要件
+- Rust stable
 
-### 2. 依存インストール
+### Windows
+
+- Microsoft C++ Build Tools
+- Microsoft Edge WebView2
+
+Tauri prerequisites:
+https://v2.tauri.app/ja/start/prerequisites/
+
+### macOS
+
+- Xcode Command Line Tools
+
+Tauri prerequisites:
+https://v2.tauri.app/ja/start/prerequisites/
+
+## Setup
+
+1. Install dependencies:
 
 ```bash
 npm install
 ```
 
-### 3. 環境変数
-
-プロジェクトルートに `.env` を作成し、以下を設定してください。
+2. Create `.env` from `.env.example` and set your API keys:
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key
-MESHY_AI_API_KEY=your_meshy_api_key
+MESHY_AI_API_KEY=your_meshy_ai_api_key
 ```
 
-## 実行方法
+## Development
 
-Tauri 統合での実行（推奨）:
+Tauri is the primary runtime target for this app.
 
 ```bash
-npm run tauri dev
+npm run tauri:dev
 ```
 
-Next.js 単体開発サーバー:
+If you only want to inspect the frontend shell:
 
 ```bash
 npm run dev
 ```
 
-本番ビルド:
+Note: browser-only execution is not the supported runtime for the full app because local file access and desktop commands depend on Tauri APIs.
+
+## Build
+
+Frontend build:
 
 ```bash
 npm run build
 ```
 
-## パイプライン概要
+Windows bundle:
 
-1. 画像アップロード
-2. Gemini でステータスと外観プロンプト生成
-3. Gemini でコンセプト画像生成
-4. Meshy で Image-to-3D
-5. Rigging + Animation（Idle/Attack）を試行
-6. 失敗時は Base GLB にフォールバック
-7. DB に保存して図鑑・バトルで利用
+```bash
+npm run tauri:build:win
+```
 
-## データ保存先
+This project is configured to generate an `nsis` installer on Windows.
 
-- SQLite: アプリデータディレクトリ配下の `robots.db`
-- 生成画像 / GLB: 同じくアプリデータディレクトリ配下
+macOS bundle:
 
+```bash
+npm run tauri:build:mac
+```
+
+This project is configured to generate `app` and `dmg` bundles on macOS.
+
+## Cross-Platform Notes
+
+- Uploads are normalized to `image/png` before calling Rust, which removes MIME inconsistencies between macOS and Windows.
+- HEIC and HEIF input are converted in the browser using `heic-to/csp`.
+- Stored local assets are read back through shared Tauri filesystem helpers, with MIME derived from file extension for images and fixed GLB MIME for models.
+- Generated app data stays under the Tauri app data directory on each OS.
+
+## Useful Files
+
+- `src/app/construction/page.tsx`
+- `src/components/RobotViewer.tsx`
+- `src/lib/upload.ts`
+- `src/lib/tauriAsset.ts`
+- `src-tauri/src/lib.rs`
+- `src-tauri/tauri.windows.conf.json`
+- `src-tauri/tauri.macos.conf.json`

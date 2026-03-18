@@ -2,39 +2,10 @@
 import React, { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Search, Database, Clock, Crosshair, Shield, Heart } from 'lucide-react';
+import LocalImage from '@/components/LocalImage';
 import RobotViewer from '@/components/RobotViewer';
 import { RobotRecord } from '@/types/robot';
 import { useStore } from '@/store/useStore';
-
-// Helper component to securely load local images via Tauri filesystem API 
-function LocalImage({ path, alt, className }: { path: string, alt: string, className?: string }) {
-    const [src, setSrc] = useState<string | null>(null);
-
-    useEffect(() => {
-        if (!path) return;
-        let url: string | null = null;
-
-        async function load() {
-            try {
-                const { readFile } = await import('@tauri-apps/plugin-fs');
-                const data = await readFile(path);
-                const blob = new Blob([data], { type: 'image/png' });
-                url = URL.createObjectURL(blob);
-                setSrc(url);
-            } catch (err) {
-                console.error("Failed to load image:", path, err);
-            }
-        }
-        load();
-
-        return () => {
-            if (url) URL.revokeObjectURL(url);
-        };
-    }, [path]);
-
-    if (!src) return <div className={`bg-zinc-800 animate-pulse ${className}`} />;
-    return <img src={src} alt={alt} className={className} />;
-}
 
 
 export default function EncyclopediaPage() {
@@ -51,9 +22,7 @@ export default function EncyclopediaPage() {
                 const sorted = data.sort((a, b) => b.created_at - a.created_at);
                 setRobots(sorted);
                 useStore.getState().setRobots(sorted); // Hydrate global store
-                if (sorted.length > 0 && !selectedRobot) {
-                    setSelectedRobot(sorted[0]);
-                }
+                setSelectedRobot((current) => current ?? sorted[0] ?? null);
             } catch (e) {
                 console.error("Failed to load robots:", e);
             } finally {

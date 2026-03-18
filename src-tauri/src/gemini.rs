@@ -17,7 +17,9 @@ struct Content {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Part {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     InlineData {
         #[serde(rename = "inlineData")]
         inline_data: InlineData,
@@ -49,7 +51,11 @@ pub struct RobotStatus {
     pub atk: i32,
     #[serde(alias = "DEF", alias = "def")]
     pub def: i32,
-    #[serde(alias = "VisualDescription", alias = "visualDescription", alias = "visual_description")]
+    #[serde(
+        alias = "VisualDescription",
+        alias = "visualDescription",
+        alias = "visual_description"
+    )]
     pub visual_description: String,
 }
 
@@ -73,6 +79,10 @@ struct CandidatePart {
     text: String,
 }
 
+const VISUAL_DESCRIPTION_BODY_REQUIREMENTS: &str = "bipedal humanoid combat robot, exactly two arms, exactly two legs, standing upright, front-facing, legs clearly separated, feet fully visible, no quadruped body plan, no spider legs, no extra limbs, no crawling pose, no wheels, no tank treads, no centaur silhouette";
+
+const IMAGE_BODY_REQUIREMENTS: &str = "Create a bipedal humanoid combat robot with exactly one head, exactly two arms, and exactly two legs. The robot must stand upright in a front-facing full-body A-pose. Both legs must be clearly separated and fully visible from hips to feet. No quadruped body plan. No spider legs. No extra limbs. No crawling pose. No beast posture. No wheels. No tank treads. No centaur shape. No floating detached limbs.";
+
 pub async fn generate_robot_status(base64_image: String) -> Result<RobotStatus, String> {
     let api_key = env::var("GEMINI_API_KEY")
         .map_err(|_| "GEMINI_API_KEY not found in environment variables".to_string())?;
@@ -82,14 +92,15 @@ pub async fn generate_robot_status(base64_image: String) -> Result<RobotStatus, 
         api_key
     );
 
-    let prompt = "この食べ物画像のカロリー、タンパク質、食物繊維を推定し、HP(500-2000), ATK(10-100), DEF(5-50)を算出し、架空の企業『オイシイ・インダストリー』が作った兵器という設定の概要(Lore)、ロボット名(Name)、および次の機能で使う画像生成AI(Text-to-Image)に入力するための、この食べ物をモチーフにしたメカニカルな戦闘ロボットの「詳細な外観プロンプト(VisualDescription英語)」を考えて、以下のスキーマの平坦なJSONのみを出力してください。\n\n※重要: プロンプト（VisualDescription）には、必ず「全身像であること（full body standing）」「頭の先から足先まで完全にフレーム内に収まっていること（extreme full body shot, feet completely visible）」を英語で明記してください。\n\n{\"name\": \"名前\", \"lore\": \"設定\", \"hp\": 1000, \"atk\": 50, \"def\": 20, \"visual_description\": \"プロンプト\"}";
+    let prompt = format!(
+        "この食べ物画像のカロリー、タンパク質、食物繊維を推定し、HP(500-2000), ATK(10-100), DEF(5-50)を算出し、架空の企業『オイシイ・インダストリー』が作った兵器という設定の概要(Lore)、ロボット名(Name)、および次の機能で使う画像生成AI(Text-to-Image)に入力するための、この食べ物をモチーフにしたメカニカルな戦闘ロボットの「詳細な外観プロンプト(VisualDescription英語)」を考えて、以下のスキーマの平坦なJSONのみを出力してください。\n\n※重要: プロンプト（VisualDescription）には、必ず「全身像であること（full body standing）」「頭の先から足先まで完全にフレーム内に収まっていること（extreme full body shot, feet completely visible）」を英語で明記してください。さらに、VisualDescription には英語で次の条件も必ず含めてください: {}.\n\n{{\"name\": \"名前\", \"lore\": \"設定\", \"hp\": 1000, \"atk\": 50, \"def\": 20, \"visual_description\": \"プロンプト\"}}",
+        VISUAL_DESCRIPTION_BODY_REQUIREMENTS
+    );
 
     let request_body = GenerateContentRequest {
         contents: vec![Content {
             parts: vec![
-                Part::Text {
-                    text: prompt.to_string(),
-                },
+                Part::Text { text: prompt },
                 Part::InlineData {
                     inline_data: InlineData {
                         mime_type: "image/png".to_string(), // または jpeg
@@ -135,9 +146,10 @@ pub async fn generate_robot_status(base64_image: String) -> Result<RobotStatus, 
         Ok(s) => s,
         Err(e) => {
             // Fallback: search for keys if the JSON is nested
-            let v: serde_json::Value = serde_json::from_str(text)
-                .map_err(|e2| format!("Failed to parse JSON: {} (orig: {}) Text: {}", e2, e, text))?;
-            
+            let v: serde_json::Value = serde_json::from_str(text).map_err(|e2| {
+                format!("Failed to parse JSON: {} (orig: {}) Text: {}", e2, e, text)
+            })?;
+
             fn find_string(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
                 if let Some(obj) = v.as_object() {
                     for (k, val) in obj {
@@ -171,8 +183,11 @@ pub async fn generate_robot_status(base64_image: String) -> Result<RobotStatus, 
             }
 
             let name = find_string(&v, &["name"]).unwrap_or_else(|| "Unknown Robot".to_string());
-            let lore = find_string(&v, &["lore"]).unwrap_or_else(|| "No lore available.".to_string());
-            let visual_description = find_string(&v, &["visual_description", "visual_description_en"]).unwrap_or_else(|| "A standard mechanical combat robot.".to_string());
+            let lore =
+                find_string(&v, &["lore"]).unwrap_or_else(|| "No lore available.".to_string());
+            let visual_description =
+                find_string(&v, &["visual_description", "visual_description_en"])
+                    .unwrap_or_else(|| "A standard mechanical combat robot.".to_string());
             let hp = find_i32(&v, &["hp"]).unwrap_or(1000);
             let atk = find_i32(&v, &["atk"]).unwrap_or(50);
             let def = find_i32(&v, &["def"]).unwrap_or(20);
@@ -218,8 +233,7 @@ struct ImageInlineData {
 }
 
 pub async fn generate_robot_image(prompt: String) -> Result<String, String> {
-    let api_key = env::var("GEMINI_API_KEY")
-        .map_err(|_| "GEMINI_API_KEY not found".to_string())?;
+    let api_key = env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not found".to_string())?;
 
     // Use nano-banana-pro-preview instead of imagen-3
     let url = format!(
@@ -227,15 +241,15 @@ pub async fn generate_robot_image(prompt: String) -> Result<String, String> {
         api_key
     );
 
-    let instruction_prompt = format!("{}, highly zoomed out, full A-pose with slightly spread arms. The ENTIRE body from the top of the head to the bottom of the feet MUST be completely visible inside the frame. Leave plenty of empty white space around the character. DO NOT crop the image at the ankles or head. single white background `#FFFFFF`, mechanical combat robot design, clear silhouette.", prompt);
+    let instruction_prompt = format!(
+        "{prompt}. {IMAGE_BODY_REQUIREMENTS} highly zoomed out, full A-pose with slightly spread arms. The ENTIRE body from the top of the head to the bottom of the feet MUST be completely visible inside the frame. Leave plenty of empty white space around the character. DO NOT crop the image at the ankles or head. Single white background #FFFFFF. Mechanical combat robot design. Clear, readable silhouette.",
+    );
 
     let request_body = GenerateContentRequest {
         contents: vec![Content {
-            parts: vec![
-                Part::Text {
-                    text: instruction_prompt,
-                },
-            ],
+            parts: vec![Part::Text {
+                text: instruction_prompt,
+            }],
         }],
         generation_config: None, // NanoBanana doesn't need responseMimeType
     };

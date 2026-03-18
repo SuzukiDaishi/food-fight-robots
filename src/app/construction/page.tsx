@@ -1,38 +1,25 @@
 "use client";
-import React, { useState, useRef } from 'react';
-import { UploadCloud, CheckCircle2, ChevronRight, Activity, Cpu, Wrench } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { UploadCloud, CheckCircle2, Activity, Cpu, Wrench } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useStore } from '@/store/useStore';
 import RobotViewer from '@/components/RobotViewer';
+import LocalImage from '@/components/LocalImage';
+import { normalizeUploadToPng, type NormalizedUpload } from '@/lib/upload';
+import { RobotRecord } from '@/types/robot';
 
-function LocalImage({ path, alt, className }: { path: string, alt: string, className?: string }) {
-  const [src, setSrc] = React.useState<string | null>(null);
+interface PipelineStats {
+  name: string;
+  lore: string;
+  hp: number;
+  atk: number;
+  def: number;
+}
 
-  React.useEffect(() => {
-    if (!path) return;
-    let url: string | null = null;
-
-    async function load() {
-      try {
-        const { readFile } = await import('@tauri-apps/plugin-fs');
-        const data = await readFile(path);
-        const blob = new Blob([data], { type: 'image/png' });
-        url = URL.createObjectURL(blob);
-        setSrc(url);
-      } catch (err) {
-        console.error("Failed to load image:", path, err);
-      }
-    }
-    load();
-
-    return () => {
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [path]);
-
-  if (!src) return <div className={`bg-zinc-800 animate-pulse ${className}`} />;
-  return <img src={src} alt={alt} className={className} />;
+interface PipelineImages {
+  original_image_path: string;
+  image_path: string;
 }
 
 export default function ConstructionPage() {
@@ -40,19 +27,39 @@ export default function ConstructionPage() {
   const setIsGenerating = useStore((state) => state.setIsGenerating);
 
   // Local State
-  const [file, setFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [upload, setUpload] = useState<NormalizedUpload | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const [isPreparingUpload, setIsPreparingUpload] = useState(false);
+  const [uploadError, setUploadError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadRef = useRef<NormalizedUpload | null>(null);
+  const selectionRequestIdRef = useRef(0);
 
   // Pipeline State
   const [loading, setLoading] = useState(false);
   const [progressMsg, setProgressMsg] = useState("");
-  const [pipelineStats, setPipelineStats] = useState<any>(null);
-  const [pipelineImages, setPipelineImages] = useState<any>(null);
-  const [finishedRobot, setFinishedRobot] = useState<any>(null);
+  const [pipelineStats, setPipelineStats] = useState<PipelineStats | null>(null);
+  const [pipelineImages, setPipelineImages] = useState<PipelineImages | null>(null);
+  const [finishedRobot, setFinishedRobot] = useState<RobotRecord | null>(null);
 
-  React.useEffect(() => {
+  const replaceUpload = useCallback((nextUpload: NormalizedUpload | null) => {
+    if (uploadRef.current?.previewUrl && uploadRef.current.previewUrl !== nextUpload?.previewUrl) {
+      URL.revokeObjectURL(uploadRef.current.previewUrl);
+    }
+
+    uploadRef.current = nextUpload;
+    setUpload(nextUpload);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (uploadRef.current?.previewUrl) {
+        URL.revokeObjectURL(uploadRef.current.previewUrl);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     const unlisteners: (() => void)[] = [];
 
     const setupListeners = async () => {
@@ -61,12 +68,12 @@ export default function ConstructionPage() {
       });
       unlisteners.push(u1);
 
-      const u2 = await listen<any>("pipeline-stats", (event) => {
+      const u2 = await listen<PipelineStats>("pipeline-stats", (event) => {
         setPipelineStats(event.payload);
       });
       unlisteners.push(u2);
 
-      const u3 = await listen<any>("pipeline-images", (event) => {
+      const u3 = await listen<PipelineImages>("pipeline-images", (event) => {
         setPipelineImages(event.payload);
       });
       unlisteners.push(u3);
@@ -94,25 +101,57 @@ export default function ConstructionPage() {
     e.stopPropagation();
     setDragActive(false);
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleFileSelected(e.dataTransfer.files[0]);
+      void handleFileSelected(e.dataTransfer.files[0]);
     }
   };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     e.preventDefault();
     if (e.target.files && e.target.files[0]) {
-      handleFileSelected(e.target.files[0]);
+      void handleFileSelected(e.target.files[0]);
     }
   };
 
-  const handleFileSelected = (f: File) => {
-    setFile(f);
-    const objectUrl = URL.createObjectURL(f);
-    setPreviewUrl(objectUrl);
-  };
+  const handleFileSelected = useCallback(async (selectedFile: File) => {
+    const requestId = ++selectionRequestIdRef.current;
+
+    replaceUpload(null);
+    setUploadError("");
+    setIsPreparingUpload(true);
+    setPipelineStats(null);
+    setPipelineImages(null);
+    setFinishedRobot(null);
+    setProgressMsg("");
+
+    try {
+      const normalizedUpload = await normalizeUploadToPng(selectedFile);
+      if (requestId !== selectionRequestIdRef.current) {
+        URL.revokeObjectURL(normalizedUpload.previewUrl);
+        return;
+      }
+
+      replaceUpload(normalizedUpload);
+    } catch (err) {
+      if (requestId !== selectionRequestIdRef.current) {
+        return;
+      }
+
+      replaceUpload(null);
+
+      const errMsg =
+        err instanceof Error
+          ? err.message
+          : "Failed to prepare the selected image. Use PNG, JPEG, HEIC, or HEIF.";
+      setUploadError(errMsg);
+    } finally {
+      if (requestId === selectionRequestIdRef.current) {
+        setIsPreparingUpload(false);
+      }
+    }
+  }, [replaceUpload]);
 
   const startPipeline = async () => {
-    if (!file) return;
+    if (!upload) return;
 
     try {
       setLoading(true);
@@ -122,23 +161,15 @@ export default function ConstructionPage() {
       setPipelineImages(null);
       setFinishedRobot(null);
 
-      const buffer = await file.arrayBuffer();
-      const uint8Array = new Uint8Array(buffer);
-      const base64String = btoa(
-        Array.from(uint8Array).map(b => String.fromCharCode(b)).join('')
-      );
-      const mimeType = file.type;
-      const dataUri = `data:${mimeType};base64,${base64String}`;
-
       setProgressMsg("Sending data to Rust backend...");
 
-      const newRobot = await invoke("run_generation_pipeline", {
-        base64Image: dataUri,
+      const newRobot = await invoke<RobotRecord>("run_generation_pipeline", {
+        base64Image: upload.dataUrl,
       });
 
       // Synchronize new robot with global Zustand state so it appears in Encyclopedia
       useStore.getState().setRobots([
-        newRobot as any,
+        newRobot,
         ...useStore.getState().robots
       ]);
 
@@ -192,22 +223,32 @@ export default function ConstructionPage() {
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/png, image/jpeg, image/heic"
+              accept="image/png,image/jpeg,image/heic,image/heif,.png,.jpg,.jpeg,.heic,.heif"
               onChange={handleChange}
               className="hidden"
             />
 
-            {previewUrl ? (
+            {upload ? (
               <div className="w-full h-full flex flex-col items-center gap-4">
-                <img src={previewUrl} alt="Preview" className="h-40 w-40 object-cover rounded-xl shadow-lg border-2 border-zinc-800" />
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={upload.previewUrl} alt="Preview" className="h-40 w-40 object-cover rounded-xl shadow-lg border-2 border-zinc-800" />
+                <p className="text-xs font-mono uppercase tracking-widest text-zinc-500">
+                  {upload.sourceFormat.toUpperCase()} normalized to PNG
+                </p>
                 <button
                   onClick={(e) => { e.stopPropagation(); startPipeline(); }}
-                  disabled={loading}
-                  className={`px-8 py-3 rounded-xl font-bold transition-all shadow-lg ${loading ? "bg-zinc-800 text-zinc-500 cursor-not-allowed" : "bg-red-600 hover:bg-red-500 text-white shadow-red-900/50 hover:scale-105"
+                  disabled={loading || isPreparingUpload}
+                  className={`px-8 py-3 rounded-xl font-bold transition-all shadow-lg ${(loading || isPreparingUpload) ? "bg-zinc-800 text-zinc-500 cursor-not-allowed" : "bg-red-600 hover:bg-red-500 text-white shadow-red-900/50 hover:scale-105"
                     }`}
                 >
-                  {loading ? "INITIALIZING..." : "INITIATE PIPELINE"}
+                  {isPreparingUpload ? "PREPARING..." : loading ? "INITIALIZING..." : "INITIATE PIPELINE"}
                 </button>
+              </div>
+            ) : isPreparingUpload ? (
+              <div className="flex flex-col items-center gap-3 text-zinc-400">
+                <div className="w-16 h-16 rounded-full border-2 border-zinc-700 border-t-red-500 animate-spin" />
+                <p className="font-medium text-lg">Normalizing Input</p>
+                <p className="text-sm text-zinc-500">Converting the selected image to PNG...</p>
               </div>
             ) : (
               <>
@@ -216,10 +257,16 @@ export default function ConstructionPage() {
                 </div>
                 <p className="text-zinc-300 font-medium text-lg">Select Food Target</p>
                 <p className="text-zinc-500 text-sm mt-2">Drag and drop an image here, or click to browse.</p>
-                <p className="text-zinc-600 text-xs mt-1">Accepts PNG, JPEG, HEIC</p>
+                <p className="text-zinc-600 text-xs mt-1">Accepts PNG, JPEG, HEIC, HEIF</p>
               </>
             )}
           </div>
+
+          {uploadError && (
+            <div className="bg-red-950/40 border border-red-900/50 rounded-2xl p-4 z-10 text-sm text-red-100">
+              {uploadError}
+            </div>
+          )}
 
           {/* Stats Preview (Appears post-Gemini analysis) */}
           {pipelineStats && (
@@ -279,7 +326,7 @@ export default function ConstructionPage() {
           <div className="flex-1 p-6 pt-0 flex flex-col z-10">
             {/* 3D Viewer or Images */}
             <div className="w-full h-full min-h-[300px] bg-zinc-950 rounded-2xl border border-zinc-800 flex items-center justify-center overflow-hidden relative">
-              {!file && !loading && !finishedRobot && (
+              {!upload && !loading && !finishedRobot && !isPreparingUpload && (
                 <div className="text-zinc-600 font-mono text-sm flex flex-col items-center gap-2">
                   <Cpu size={32} />
                   Awaiting Input Data

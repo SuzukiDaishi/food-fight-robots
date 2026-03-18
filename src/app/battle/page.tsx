@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ShieldAlert, Flame, Droplets, Zap, Shield, Swords, RotateCcw, RefreshCcw, Gauge } from 'lucide-react';
 import { useStore } from '@/store/useStore';
 import { Model } from '@/components/RobotViewer';
+import { useTauriObjectUrl } from '@/hooks/useTauriObjectUrl';
 import { invoke } from '@tauri-apps/api/core';
 import { RobotRecord } from '@/types/robot';
 import { Canvas, useFrame } from '@react-three/fiber';
@@ -98,9 +99,12 @@ function BattleRobotModel({
     attackFxTrigger: number,
     effectsEnabled: boolean,
 }) {
-    const [idleUrl, setIdleUrl] = useState<string | null>(null);
-    const [attackUrl, setAttackUrl] = useState<string | null>(null);
     const groupRef = useRef<THREE.Group>(null);
+    const attackPath = robot.attack_model_path && robot.attack_model_path !== robot.model_path
+        ? robot.attack_model_path
+        : robot.model_path;
+    const { url: idleUrl } = useTauriObjectUrl(robot.model_path, "model");
+    const { url: attackUrl } = useTauriObjectUrl(attackPath, "model");
 
     useFrame((state) => {
         if (!groupRef.current) return;
@@ -110,41 +114,6 @@ function BattleRobotModel({
         groupRef.current.position.y = -1 + hitShake;
         groupRef.current.rotation.z = isHit ? Math.sin(state.clock.elapsedTime * 22) * 0.03 : 0;
     });
-
-    useEffect(() => {
-        let idleU: string | null = null;
-        let attackU: string | null = null;
-        let disposed = false;
-        async function loadAsset() {
-            try {
-                const { readFile } = await import('@tauri-apps/plugin-fs');
-                const idleData = await readFile(robot.model_path);
-                const idleBlob = new Blob([idleData], { type: 'model/gltf-binary' });
-                idleU = URL.createObjectURL(idleBlob);
-                if (disposed) return;
-                setIdleUrl(idleU);
-
-                if (robot.attack_model_path && robot.attack_model_path !== robot.model_path) {
-                    const attackData = await readFile(robot.attack_model_path);
-                    const attackBlob = new Blob([attackData], { type: 'model/gltf-binary' });
-                    attackU = URL.createObjectURL(attackBlob);
-                    if (disposed) return;
-                    setAttackUrl(attackU);
-                } else {
-                    setAttackUrl(idleU);
-                }
-            } catch (e) {
-                console.error("Failed to load 3D models from disk:", e);
-            }
-        }
-        loadAsset();
-
-        return () => {
-            disposed = true;
-            if (idleU) URL.revokeObjectURL(idleU);
-            if (attackU && attackU !== idleU) URL.revokeObjectURL(attackU);
-        };
-    }, [robot.id, robot.model_path, robot.attack_model_path]);
 
     if (!idleUrl || !attackUrl) return null;
 
